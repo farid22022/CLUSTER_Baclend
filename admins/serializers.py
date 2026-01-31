@@ -138,8 +138,8 @@ class CustomUserSerializer(serializers.ModelSerializer):
 
 class ProfileSerializer(CustomUserSerializer):
     class Meta(CustomUserSerializer.Meta):
-        fields = ['id', 'name', 'email', 'photo', 'role', 'assigned_pages', 'assignedAt']
-        read_only_fields = ['email', 'role', 'assigned_pages', 'assignedAt']
+        fields = ['id', 'name', 'email', 'photo', 'role', 'assigned_pages', 'assigned_pages_details']
+        read_only_fields = ['email', 'role', 'assigned_pages',  'assigned_pages_details']
 class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
