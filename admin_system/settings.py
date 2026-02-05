@@ -206,11 +206,11 @@ DATABASES = {
     # }
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'cluster_db',
-        'USER': 'root',
-        'PASSWORD': '2633123@Farid',
-        'HOST': '127.0.0.1',
-        'PORT': '3306',
+        'NAME': 'cluster_db',        # your database name
+        'USER': 'cluster_db',        # use the MySQL user you created
+        'PASSWORD': 'ClusterDb@123', # password for cluster_db
+        'HOST': '127.0.0.1',         # localhost
+        'PORT': '3306',              # default MySQL port
     }
 }
 
@@ -299,3 +299,12 @@ SECURE_BROWSER_XSS_FILTER = True
 X_FRAME_OPTIONS = 'DENY'
 
 # Rate limiting (use django-ratelimit or similar in production)
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'mdfaridhossenrehad@gmail.com'
+EMAIL_HOST_PASSWORD = 'temr zfbm okly imsg'  # Use App Password if 2FA enabled
+DEFAULT_FROM_EMAIL = 'mdfaridhossenrehad@gmail.com'
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10 MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10 MB

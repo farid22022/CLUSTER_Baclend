@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import CustomUser, Page
+from .models import CustomUser, Page, Blog
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
@@ -19,5 +19,17 @@ class CustomUserAdmin(admin.ModelAdmin):
 class PageAdmin(admin.ModelAdmin):
     list_display = ('name', 'description')
     search_fields = ('name',)
+    
+    
+@admin.register(Blog)
+class BlogAdmin(admin.ModelAdmin):
+    list_display = (
+        'title', 'approval_status', 'category', 'author',
+        'date', 'restricted', 'created_by', 'created_at'
+    )
+    list_filter = ('approval_status', 'category', 'restricted', 'date')
+    search_fields = ('title', 'excerpt', 'author')
+    list_editable = ('approval_status',)  # optional: quick edit in list view
+    date_hierarchy = 'date'    
     
 # python manage.py createsuperuser --email superadmin@cseku.ac.bd --name "Super Admin"    # 
