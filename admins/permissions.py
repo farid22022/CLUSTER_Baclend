@@ -1,72 +1,57 @@
-
 from rest_framework.permissions import BasePermission, SAFE_METHODS
-
-class IsStudent(BasePermission):
-    def has_permission(self, request, view):
-        return (
-            request.user.is_authenticated and
-            request.user.role == 'STUDENT'
-        )
-
-class IsSuperAdmin(BasePermission):
-    def has_permission(self, request, view):
-        return (
-            request.user.is_authenticated and
-            request.user.role == 'SUPER_ADMIN'
-        )
+from .models import SystemSetting
 
 
-class IsAdminOrSuperAdmin(BasePermission):
-    def has_permission(self, request, view):
-        return (
-            request.user.is_authenticated and
-            request.user.role in ('ADMIN', 'SUPER_ADMIN')
-        )
-
-
-class IsLayeredAdminForPage(BasePermission):
-    """Used for content management on specific pages"""
+class IsAuthenticatedStudent(BasePermission):
     def has_permission(self, request, view):
         if not request.user.is_authenticated:
             return False
+        current_role = request.user.current_role
+        return current_role is not None and current_role.name.upper() == 'STUDENT'
 
-        if request.user.role in ('SUPER_ADMIN', 'ADMIN'):
-            return True
 
-        if request.user.role != 'LAYERED_ADMIN':
+class IsCurrentPresident(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.is_current_president
+
+
+class IsPresidentOrAdmin(BasePermission):
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
             return False
+        role = request.user.current_role
+        if not role:
+            return False
+        return role.is_president or 'admin' in role.name.lower()
 
+
+class HasPagePermission(BasePermission):
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
         page_name = getattr(view, 'page_name', None)
         if not page_name:
-            return False
+            return True
+        return request.user.current_permissions.filter(name__iexact=page_name).exists()
 
-        return request.user.assigned_pages.filter(name__iexact=page_name).exists()
+
+class CanModifyCurrentYearContent(BasePermission):
+    def has_object_permission(self, request, view, obj):
+        if request.method in SAFE_METHODS:
+            return True
+        current_year = SystemSetting.get_current_year()
+        obj_year = getattr(obj, 'year', None)
+        return obj_year == current_year if obj_year is not None else True
 
 
-class IsSuperAdminOnlyForSensitiveActions(BasePermission):
-    """Restrict dangerous actions (promote to superadmin, assign pages, delete superadmin)"""
+class IsPresidentOnlyForDangerousActions(BasePermission):
     def has_permission(self, request, view):
-        return request.user.is_authenticated and request.user.role == 'SUPER_ADMIN'
+        return request.user.is_authenticated and request.user.is_current_president
 
     def has_object_permission(self, request, view, obj):
-        if not request.user.role == 'SUPER_ADMIN':
+        if not request.user.is_current_president:
             return False
-        # Prevent SUPER_ADMIN from demoting/deleting other SUPER_ADMIN (optional strict mode)
-        if obj.role == 'SUPER_ADMIN' and obj != request.user:
-            return False
+        # Extra protection: can't modify other presidents
+        if hasattr(obj, 'role') and obj.role and obj.role.is_president:
+            return obj == request.user
         return True
-
-
-
-
-class IsAssignedToPage(BasePermission):
-    def has_permission(self, request, view):
-        if not request.user or not request.user.is_authenticated:
-            return False
-
-        # Check if user has access to this page (based on view's page_id)
-        page_id = getattr(view, 'page_id', None)
-        if not page_id:
-            return False
-
-        return page_id in request.user.assigned_pages.values_list('name', flat=True) or getattr(request.user, 'role', None) == 'SUPER_ADMIN'

@@ -7,8 +7,11 @@ from django.conf import settings
 from django.utils import timezone
 import random
 import string
+from simple_history.models import HistoricalRecords
 
 
+def get_current_year_default():
+    return timezone.now().year
 
 class CustomUserManager(BaseUserManager):
     def create_user(self, email, name, password=None, **extra_fields):
@@ -32,33 +35,73 @@ class CustomUserManager(BaseUserManager):
             raise ValueError('Superuser must have is_superuser=True.')
 
         return self.create_user(email, name, password, **extra_fields)
-    
-    
+
+# new 4.42 PM 09/02/26
+class SystemSetting(models.Model):
+    """Singleton for system-wide settings like current_year."""
+    key = models.CharField(max_length=100, unique=True)
+    value = models.CharField(max_length=255)
+
+    @classmethod
+    def get_current_year(cls):
+        obj, _ = cls.objects.get_or_create(key='current_year', defaults={'value': str(timezone.now().year)})
+        return int(obj.value)
+
+    @classmethod
+    def set_current_year(cls, year):
+        obj, _ = cls.objects.get_or_create(key='current_year')
+        obj.value = str(year)
+        obj.save()
+
 class Page(models.Model):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
 
     def __str__(self):
         return self.name
+    
+# new 4.42 PM 09/02/26        
+class Role(models.Model):
+    name = models.CharField(max_length=100, unique=True)  # e.g., 'Vice President', 'Treasurer'
+    permissions = models.ManyToManyField(Page, blank=True, related_name='roles')  # Pages/routes accessible
+    is_president = models.BooleanField(default=False)  # Special flag for President (Super Admin)
+    created_by = models.ForeignKey('CustomUser', on_delete=models.SET_NULL, null=True, related_name='created_roles')
+    created_at = models.DateTimeField(auto_now_add=True)
+    history = HistoricalRecords()  # Audit changes
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        unique_together = ['name']  # Ensure unique roles
+        indexes = [models.Index(fields=['name'])]            
+# new 4.42 PM 09/02/26    
+class CommitteeMembership(models.Model):
+    user = models.ForeignKey('CustomUser', on_delete=models.CASCADE, related_name='memberships')
+    role = models.ForeignKey(Role, on_delete=models.PROTECT, related_name='memberships')
+    year = models.PositiveIntegerField(default=get_current_year_default)  # e.g., 2026
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    history = HistoricalRecords()  # Audit changes
+
+    def __str__(self):
+        return f"{self.user} - {self.role} ({self.year})"
+
+    class Meta:
+        unique_together = ['user', 'year']  # One role per user per year
+        indexes = [models.Index(fields=['year', 'user'])]
+
 
 class CustomUser(AbstractBaseUser, PermissionsMixin):
-    ROLE_CHOICES = (
-        ('SUPER_ADMIN', 'Super Admin'),
-        ('ADMIN',       'Admin'),
-        ('LAYERED_ADMIN', 'Layered Admin'),
-        ('STUDENT',     'Student'),
-    )
-
-    name          = models.CharField(max_length=255)
-    email         = models.EmailField(unique=True)
-    photo         = models.URLField(max_length=500, blank=True, null=True)
-    role          = models.CharField(max_length=20, choices=ROLE_CHOICES, default='STUDENT')
-    assigned_pages = models.ManyToManyField(Page, blank=True, related_name='assigned_users')
-    student_id    = models.CharField(max_length=50, blank=True)
-    phone_number  = models.CharField(max_length=20, blank=True)
-    is_staff      = models.BooleanField(default=False)
-    is_active     = models.BooleanField(default=False)
-    date_joined   = models.DateTimeField(default=timezone.now)
+    # ... (remove fixed ROLE_CHOICES and assigned_pages; derive from membership)
+    name = models.CharField(max_length=255)
+    email = models.EmailField(unique=True)
+    photo = models.URLField(max_length=500, blank=True, null=True)
+    student_id = models.CharField(max_length=50, blank=True)
+    phone_number = models.CharField(max_length=20, blank=True)
+    is_staff = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=False)
+    date_joined = models.DateTimeField(default=timezone.now)
+    history = HistoricalRecords()  
 
     objects = CustomUserManager()
 
@@ -73,6 +116,27 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
             raise ValueError('Email must end with @cseku.ac.bd')
         super().save(*args, **kwargs)
 
+    @property
+    def current_membership(self):
+        current_year = SystemSetting.get_current_year()
+        return self.memberships.filter(year=current_year).first()
+
+    @property
+    def current_role(self):
+        membership = self.current_membership
+        return membership.role if membership else None
+
+    @property
+    def is_current_president(self):
+        role = self.current_role
+        return role and role.is_president
+
+    @property
+    def current_permissions(self):
+        role = self.current_role
+        return role.permissions.all() if role else Page.objects.none()
+    
+    
 
 class PendingRegistration(models.Model):
     """
@@ -124,15 +188,16 @@ class Project(models.Model):
     team = models.JSONField(default=list)
     github = models.URLField(
         blank=True,
-        null=True,          # ← keep null=True to avoid migration pain
-        default=''          # ← default empty string
+        null=True,          
+        default=''          
     )
     demo = models.URLField(
         blank=True,
         null=True,
         default=''
     )
-    year = models.CharField(max_length=4)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
     domain = models.CharField(max_length=100)
     image = models.CharField(   # or ImageField if using uploads
         max_length=500,
@@ -170,6 +235,8 @@ class Blog(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.title
@@ -190,6 +257,8 @@ class Resource(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.title
@@ -210,6 +279,8 @@ class Event(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.title
@@ -226,6 +297,8 @@ class Alumni(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.name
@@ -242,6 +315,8 @@ class TeamMember(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.name
@@ -255,6 +330,8 @@ class SuccessStory(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.name
@@ -265,6 +342,8 @@ class FAQs(models.Model):
     created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
     def __str__(self):
         return self.question
@@ -287,6 +366,8 @@ class Post(models.Model):
     author = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True, related_name='posts')
     created_at = models.DateTimeField(auto_now_add=True, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
+    year = models.PositiveIntegerField(default=get_current_year_default)
+    history = HistoricalRecords()
 
 
     def __str__(self):

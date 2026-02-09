@@ -1,167 +1,141 @@
-# admins/views.py           
-from rest_framework.views import APIView
+
+
+
+"""
+Views for the CLUSTER admin backend API.
+Handles authentication, user management, content CRUD with approval workflows,
+and yearly team committee import/transition features.
+"""
+from io import StringIO
+import csv
+
 from rest_framework import viewsets, status
+from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated, SAFE_METHODS
 from rest_framework_simplejwt.tokens import RefreshToken
-
+from django.db import transaction
 from django.core.mail import send_mail
 from django.conf import settings
 from django.utils.crypto import get_random_string
 from django.utils import timezone
-
-from .models import CustomUser, Page, PendingRegistration, Project, Blog, Resource, Event, OTP,Alumni, TeamMember, SuccessStory, FAQs,Post
-from .serializers import (
-    PendingRegistrationSerializer, CustomUserSerializer, ProfileSerializer, PageSerializer,
-    ProjectSerializer, AlumniSerializer, TeamMemberSerializer,
-    BlogSerializer, ResourceSerializer, EventSerializer,
-    SuccessStorySerializer, FAQsSerializer,PostSerializer
+from django.contrib.auth.hashers import make_password
+from rest_framework.request import Request
+from .models import (
+    CustomUser, Page, PendingRegistration, Project, Blog, Resource, Event,
+    Alumni, TeamMember, SuccessStory, FAQs, Post, Role, CommitteeMembership,
+    SystemSetting
 )
-from .permissions import IsSuperAdmin, IsAdminOrSuperAdmin,IsStudent
+from .serializers import (
+    PendingRegistrationSerializer, CustomUserSerializer, ProfileSerializer,
+    PageSerializer, ProjectSerializer, AlumniSerializer, TeamMemberSerializer,
+    BlogSerializer, ResourceSerializer, EventSerializer,
+    SuccessStorySerializer, FAQsSerializer, PostSerializer,
+    RoleSerializer, CommitteeMembershipSerializer
+)
+from .permissions import (
+    IsCurrentPresident,
+    IsPresidentOrAdmin,
+    HasPagePermission,
+    CanModifyCurrentYearContent,
+)
 
+
+# ────────────────────────────────────────────────
+# Helper functions
+# ────────────────────────────────────────────────
+
+def get_current_year():
+    return SystemSetting.get_current_year()
+
+
+# ────────────────────────────────────────────────
+# Authentication Views
+# ────────────────────────────────────────────────
 
 class RegistrationView(APIView):
+    """Register a new user → sends OTP to email."""
     permission_classes = [AllowAny]
 
     def post(self, request):
-        email = request.data.get('email')
+        email = request.data.get("email")
 
-        # Check if already verified user exists
         if CustomUser.objects.filter(email=email).exists():
-            return Response(
-                {"error": "This email is already registered and verified."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": "Email already registered."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Delete any old pending record for this email
         PendingRegistration.objects.filter(email=email).delete()
 
         serializer = PendingRegistrationSerializer(data=request.data)
-        if serializer.is_valid():
-            pending = serializer.save()  # hashed_password set in serializer
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            # Generate new OTP
-            otp_code = get_random_string(length=6, allowed_chars='0123456789')
-            pending.otp = otp_code
-            pending.save()
+        pending = serializer.save()
+        otp = get_random_string(length=6, allowed_chars="0123456789")
+        pending.otp = otp
+        pending.save()
 
-            # Send email
-            send_mail(
-                subject='Your CLUSTER Registration OTP',
-                message=f'Your OTP is: {otp_code}\nIt expires in 10 minutes.',
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[pending.email],
-                fail_silently=False,
-            )
+        send_mail(
+            subject="CLUSTER Registration OTP",
+            message=f"Your OTP: {otp}\nValid for 10 minutes.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
 
-            return Response({
-                'message': 'OTP sent to your email. Please verify to complete registration.',
-                'pending_id': pending.id
-            }, status=status.HTTP_200_OK)
-
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            "message": "OTP sent. Verify to complete registration.",
+            "pending_id": pending.id,
+        }, status=status.HTTP_200_OK)
 
 
-
-class ResendOTPView(APIView):
-    """
-    Resend OTP for an existing pending registration
-    """
-    permission_classes = [AllowAny]
-
-    def post(self, request):
-        email = request.data.get('email')
-
-        if not email:
-            return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            pending = PendingRegistration.objects.get(email=email)
-
-            # Optional: check if too many resends (rate limiting)
-            if timezone.now() - pending.created_at > timezone.timedelta(hours=1):
-                pending.delete()
-                return Response({"error": "Session expired. Please register again."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Generate new OTP
-            otp_code = get_random_string(length=6, allowed_chars='0123456789')
-            pending.otp = otp_code
-            pending.save()
-
-            # Re-send email
-            send_mail(
-                subject='Your CLUSTER Registration OTP (Resent)',
-                message=f'Your new OTP is: {otp_code}\nIt expires in 10 minutes.',
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[pending.email],
-                fail_silently=False,
-            )
-
-            return Response({
-                'message': 'New OTP sent to your email.',
-                'pending_id': pending.id
-            }, status=status.HTTP_200_OK)
-
-        except PendingRegistration.DoesNotExist:
-            return Response({"error": "No pending registration found for this email. Please register first."}, status=status.HTTP_404_NOT_FOUND)
-        
-        
 class VerifyOTPView(APIView):
-    """
-    Verify OTP → create real CustomUser if valid → delete pending record
-    """
+    """Verify OTP and complete registration."""
     permission_classes = [AllowAny]
 
     def post(self, request):
         pending_id = request.data.get('pending_id')
-        otp_input = request.data.get('otp')
+        otp = request.data.get('otp')
 
         try:
-            pending = PendingRegistration.objects.get(id=pending_id)
-
-            if pending.otp != otp_input:
-                return Response({'error': 'Invalid OTP'}, status=status.HTTP_400_BAD_REQUEST)
-
+            pending = PendingRegistration.objects.get(id=pending_id, otp=otp)
             if not pending.is_valid():
                 pending.delete()
-                return Response({'error': 'OTP expired. Please register again.'}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({'error': 'OTP expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Create real user
             user = CustomUser.objects.create(
                 name=pending.name,
                 email=pending.email,
                 student_id=pending.student_id,
                 phone_number=pending.phone_number,
-                role='STUDENT',
-                is_active=True
+                is_active=True,
             )
-            user.password = pending.hashed_password  # already hashed
+            user.password = pending.hashed_password
             user.save()
 
-            # Clean up
             pending.delete()
 
-            # Issue JWT tokens
             refresh = RefreshToken.for_user(user)
             return Response({
-                'message': 'Account verified and activated!',
+                'message': 'Registration complete.',
                 'access': str(refresh.access_token),
-                'refresh': str(refresh)
-            }, status=status.HTTP_200_OK)
+                'refresh': str(refresh),
+            })
 
         except PendingRegistration.DoesNotExist:
-            return Response({'error': 'Invalid registration session'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Invalid OTP or registration session.'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class LogoutView(APIView):
+    """Logout by blacklisting refresh token."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         try:
-            refresh = RefreshToken(request.data.get('refresh'))
-            refresh.blacklist()
-            return Response({"message": "Logout successful"}, status=status.HTTP_205_RESET_CONTENT)
+            refresh_token = request.data["refresh"]
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response({"message": "Logout successful."})
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -169,34 +143,77 @@ class LogoutView(APIView):
 # ────────────────────────────────────────────────
 # User & Profile Management
 # ────────────────────────────────────────────────
+
 class CustomUserViewSet(viewsets.ModelViewSet):
     queryset = CustomUser.objects.all()
     serializer_class = CustomUserSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
-            return [IsAdminOrSuperAdmin()]
-        if self.action in ['update', 'partial_update', 'destroy']:
-            return [IsSuperAdmin()]
-        return [IsAuthenticated()]
+        if self.action in ['list', 'retrieve', 'me']:
+            return [IsAuthenticated()]
+        return [IsCurrentPresident()]
 
-    @action(detail=False, methods=['get', 'patch'], permission_classes=[IsAuthenticated])
-    def profile(self, request):
-        user = request.user
-        if request.method == 'GET':
-            serializer = ProfileSerializer(user)
-            return Response(serializer.data)
-        
-        serializer = ProfileSerializer(user, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        serializer = CustomUserSerializer(request.user)
         return Response(serializer.data)
 
+
+# ────────────────────────────────────────────────
+# Role & Membership Management
+# ────────────────────────────────────────────────
 
 class PageViewSet(viewsets.ModelViewSet):
     queryset = Page.objects.all()
     serializer_class = PageSerializer
-    permission_classes = [IsAdminOrSuperAdmin]
+    permission_classes = [IsCurrentPresident]
+
+
+class RoleViewSet(viewsets.ModelViewSet):
+    queryset = Role.objects.all()
+    serializer_class = RoleSerializer
+    permission_classes = [IsCurrentPresident]
+
+
+class CommitteeMembershipViewSet(viewsets.ModelViewSet):
+    queryset = CommitteeMembership.objects.all()
+    serializer_class = CommitteeMembershipSerializer
+    permission_classes = [IsCurrentPresident]
+
+    def get_queryset(self):
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs
+
+
+# ────────────────────────────────────────────────
+# Handover Endpoint
+# ────────────────────────────────────────────────
+
+class HandoverView(APIView):
+    permission_classes = [IsCurrentPresident]
+
+    @transaction.atomic
+    def post(self, request):
+        current_year = get_current_year()
+        next_year = current_year + 1
+
+        if not CommitteeMembership.objects.filter(
+            year=next_year,
+            role__is_president=True
+        ).exists():
+            return Response(
+                {"error": "No President assigned for next year."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        SystemSetting.set_current_year(next_year)
+        return Response({
+            "message": f"Handover completed. Current year is now {next_year}."
+        })
 
 
 # ────────────────────────────────────────────────
@@ -210,67 +227,90 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
             return [AllowAny()]
-        if self.action == 'create':
-            return [IsAuthenticated()]
-        return [IsAdminOrSuperAdmin()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated and self.request.user.role in ['LAYERED_ADMIN', 'SUPER_ADMIN']:
-            return Project.objects.all()
-        return Project.objects.filter(approval_status='approved')
+        
+        """
+        IMPORTANT FIX:
+        - On LIST → filter by year (good for dashboard)
+        - On DETAIL actions (update, delete, approve, etc.) → return full queryset
+        """
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset   # ← Critical: No year filter here
+
+        # Only filter by year on list view
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def approve(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'approved'
+        obj.approval_status = 'APPROVED'
         obj.save()
-        return Response(ProjectSerializer(obj).data)
+        return Response({'message': 'Project Approved Successfully'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def reject(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'rejected'
+        obj.approval_status = 'REJECTED'
         obj.save()
-        return Response(ProjectSerializer(obj).data)
+        return Response({'message': 'Project Rejected'})
 
-
-# Similar pattern for Blog & Resource (omitted for brevity — same as Project)
 
 class BlogViewSet(viewsets.ModelViewSet):
-    queryset = Blog.objects.all()
+    queryset = Blog.objects.all().order_by('-created_at')
     serializer_class = BlogSerializer
 
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
             return [AllowAny()]
-        if self.action == 'create':
-            return [IsAuthenticated()]
-        return [IsAdminOrSuperAdmin()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated and self.request.user.role in ['LAYERED_ADMIN', 'SUPER_ADMIN']:
-            return Blog.objects.all()
-        return Blog.objects.filter(approval_status='approved')
+        """
+        IMPORTANT FIX:
+        - On LIST → filter by year (good for dashboard)
+        - On DETAIL actions (update, delete, approve, etc.) → return full queryset
+        """
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset   # ← Critical: No year filter here
+
+        # Only filter by year on list view
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def approve(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'approved'
+        obj.approval_status = 'APPROVED'
         obj.save()
-        return Response(BlogSerializer(obj).data)
+        return Response({'message': 'Approved'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def reject(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'rejected'
+        obj.approval_status = 'REJECTED'
         obj.save()
-        return Response(BlogSerializer(obj).data)
+        return Response({'message': 'Rejected'})
 
 
 class ResourceViewSet(viewsets.ModelViewSet):
@@ -280,31 +320,36 @@ class ResourceViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
             return [AllowAny()]
-        if self.action == 'create':
-            return [IsAuthenticated()]
-        return [IsAdminOrSuperAdmin()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated and self.request.user.role in ['LAYERED_ADMIN', 'SUPER_ADMIN']:
-            return Resource.objects.all()
-        return Resource.objects.filter(approval_status='approved')
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def approve(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'approved'
+        obj.approval_status = 'APPROVED'
         obj.save()
-        return Response(ResourceSerializer(obj).data)
+        return Response({'message': 'Resource Approved Successfully'})
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsPresidentOrAdmin])
     def reject(self, request, pk=None):
         obj = self.get_object()
-        obj.approval_status = 'rejected'
+        obj.approval_status = 'REJECTED'
         obj.save()
-        return Response(ResourceSerializer(obj).data)
+        return Response({'message': 'Resource Rejected'})
 
 
 class EventViewSet(viewsets.ModelViewSet):
@@ -314,73 +359,234 @@ class EventViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
             return [AllowAny()]
-        if self.action == 'create':
-            return [IsAuthenticated()]
-        return [IsAdminOrSuperAdmin()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
 
     def get_queryset(self):
-        # Everyone sees all events (no approval for events yet)
-        return Event.objects.all()
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset 
+        if self.action in ['retrieve','update', 'partial_update', 'destroy']:
+            return self.queryset  
+        
+        # Only apply year filter on list
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs.order_by('-date')
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
-
-
-# Admin-only content
-class AlumniViewSet(viewsets.ModelViewSet):
-    queryset = Alumni.objects.all()
-    serializer_class = AlumniSerializer
-    permission_classes = [IsAdminOrSuperAdmin]
-
-
-class TeamMemberViewSet(viewsets.ModelViewSet):
-    queryset = TeamMember.objects.all()
-    serializer_class = TeamMemberSerializer
-    permission_classes = [IsAdminOrSuperAdmin]
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
 
 
 class SuccessStoryViewSet(viewsets.ModelViewSet):
     queryset = SuccessStory.objects.all()
     serializer_class = SuccessStorySerializer
-    permission_classes = [IsAdminOrSuperAdmin]
-# admins/views.py (add at the end)
-# admins/views.py
-# ... (other imports and views unchanged)
-
-class PostViewSet(viewsets.ModelViewSet):
-    queryset = Post.objects.all()
-    serializer_class = PostSerializer
 
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
             return [AllowAny()]
-        return [IsAdminOrSuperAdmin()]  # Restrict create/update/delete to admins (including create)
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated and self.request.user.role in ['ADMIN', 'SUPER_ADMIN', 'LAYERED_ADMIN']:
-            return Post.objects.all()
-        # return Post.objects.filter(approval_status='approved')  # Remove this line if no approval_status
-        return Post.objects.all()
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset 
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy']:
+            return self.queryset
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs
 
     def perform_create(self, serializer):
-        serializer.save(author=self.request.user)  # Use 'author' (no created_by)
-
-    # @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
-    # def approve(self, request, pk=None):
-    #     obj = self.get_object()
-    #     obj.approval_status = 'approved'
-    #     obj.save()
-    #     return Response(PostSerializer(obj).data)
-
-    # @action(detail=True, methods=['post'], permission_classes=[IsAdminOrSuperAdmin])
-    # def reject(self, request, pk=None):
-    #     obj = self.get_object()
-    #     obj.approval_status = 'rejected'
-    #     obj.save()
-    #     return Response(PostSerializer(obj).data)  # Fixed typo (was ResourceSerializer)
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
 
 
 class FAQsViewSet(viewsets.ModelViewSet):
     queryset = FAQs.objects.all()
     serializer_class = FAQsSerializer
-    permission_classes = [IsAdminOrSuperAdmin]
+
+    def get_permissions(self):
+        if self.request.method in SAFE_METHODS:
+            return [AllowAny()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
+
+    def get_queryset(self):
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy', 'approve', 'reject']:
+            return self.queryset 
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy']:
+            return self.queryset
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(
+            created_by=self.request.user,
+            year=get_current_year()
+        )
+
+
+class PostViewSet(viewsets.ModelViewSet):
+    queryset = Post.objects.all()
+    serializer_class = PostSerializer
+    pagination_class = None
+    
+    def get_permissions(self):
+        if self.request.method in SAFE_METHODS:
+            return [AllowAny()]
+        return [HasPagePermission(), CanModifyCurrentYearContent()]
+
+    def get_queryset(self):
+        if self.action in ['retrieve', 'update', 'partial_update', 'destroy']:
+            return self.queryset
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        # Optional: order by newest first
+        return qs.order_by('-created_at')
+
+    def perform_create(self, serializer):
+        serializer.save(
+            author=self.request.user,
+            year=SystemSetting.get_current_year()
+        )
+
+    
+
+
+# ────────────────────────────────────────────────
+# Archive / Read-only Models
+# ────────────────────────────────────────────────
+
+class AlumniViewSet(viewsets.ModelViewSet):
+    queryset = Alumni.objects.all()
+    serializer_class = AlumniSerializer
+    permission_classes = [IsPresidentOrAdmin, CanModifyCurrentYearContent]
+
+    def get_queryset(self):
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs
+
+
+class TeamMemberViewSet(viewsets.ModelViewSet):
+    queryset = TeamMember.objects.all()
+    serializer_class = TeamMemberSerializer
+    permission_classes = [IsPresidentOrAdmin, CanModifyCurrentYearContent]
+
+    def get_queryset(self):
+        year = self.request.query_params.get('year')
+        qs = self.queryset
+        if year:
+            qs = qs.filter(year=year)
+        return qs
+
+
+# ────────────────────────────────────────────────
+# Yearly Committee CSV Import
+# ────────────────────────────────────────────────
+
+class ImportTeamMembersView(APIView):
+    """
+    President-only endpoint.
+    Imports committee from CSV → creates/updates users, roles, memberships, TeamMember entries.
+    Optionally archives previous year's committee to Alumni.
+    """
+    permission_classes = [IsCurrentPresident]
+
+    def post(self, request):
+        archive_old = request.data.get("archive_old", False)
+        file = request.FILES.get("file")
+        target_year = int(request.data.get('year', get_current_year()))
+
+        if not file:
+            return Response({"error": "CSV file is required"}, status=400)
+
+        try:
+            if archive_old:
+                prev_year = target_year - 1
+                old_memberships = CommitteeMembership.objects.filter(year=prev_year)
+                for m in old_memberships:
+                    Alumni.objects.create(
+                        name=m.user.name,
+                        role=m.role.name,
+                        email=m.user.email,
+                        # image_url=... (you may want to copy from TeamMember if exists)
+                        year=prev_year,
+                        created_by=request.user,
+                    )
+                old_memberships.delete()
+
+            content = file.read().decode("utf-8-sig")
+            reader = csv.DictReader(StringIO(content))
+
+            count = 0
+
+            for row in reader:
+                role_name = row.get("Designation", "").strip()
+                name = row.get("Name", "").strip()
+                email = row.get("Email", "").strip()
+
+                if not role_name or not email or not name:
+                    continue
+
+                user, _ = CustomUser.objects.update_or_create(
+                    email=email,
+                    defaults={
+                        "name": name,
+                        "password": make_password(f"committee{target_year}!"),
+                        "is_active": True,
+                        "is_staff": True,
+                        "student_id": row.get("Student ID", ""),
+                        "photo": row.get("Image URL", ""),
+                    }
+                )
+
+                role, _ = Role.objects.get_or_create(
+                    name=role_name,
+                    defaults={"created_by": request.user}
+                )
+
+                CommitteeMembership.objects.update_or_create(
+                    user=user,
+                    year=target_year,
+                    defaults={"role": role}
+                )
+
+                TeamMember.objects.update_or_create(
+                    email=email,
+                    defaults={
+                        "designation": role_name,
+                        "name": name,
+                        "student_id": row.get("Student ID", ""),
+                        "image_url": row.get("Image URL", ""),
+                        "facebook_url": row.get("Facebook URL", ""),
+                        "linkedin_url": row.get("LinkedIn URL", ""),
+                        "quote": row.get("Quote", ""),
+                        "created_by": request.user,
+                        "year": target_year,
+                    }
+                )
+
+                count += 1
+
+            msg = f"Processed {count} committee members for year {target_year}."
+            if archive_old:
+                msg += f" Previous year ({target_year-1}) archived."
+
+            return Response({"message": msg}, status=200)
+
+        except Exception as e:
+            return Response({"error": f"Import failed: {str(e)}"}, status=400)

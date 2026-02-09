@@ -155,6 +155,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'django_extensions', 
     'rest_framework_simplejwt.token_blacklist',
+    'simple_history',
     'admins',  # Our app
 ]
 

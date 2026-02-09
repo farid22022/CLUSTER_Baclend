@@ -1,26 +1,55 @@
+# admins/admin.py
 from django.contrib import admin
-from .models import CustomUser, Page, Blog
+from django.utils.html import format_html
+from .models import CustomUser, Page, Blog, Role, CommitteeMembership, SystemSetting
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
-    list_display = ('email', 'name', 'role', 'date_joined', 'is_staff')
+    list_display = (
+        'email',
+        'name',
+        'current_role_display',        
+        'date_joined',
+        'is_staff',
+        'is_active',
+    )
     search_fields = ('email', 'name')
-    list_filter = ('role', 'is_staff')
-    fieldsets = (
-        (None, {'fields': ('email', 'password')}),
-        ('Personal info', {'fields': ('name', 'photo')}),
-        ('Permissions', {'fields': ('role', 'assigned_pages', 'is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
-        ('Important dates', {'fields': ('last_login', 'date_joined')}),
+    list_filter = (
+        'is_staff',
+        'is_active',
+        'date_joined',
+        
     )
     readonly_fields = ('date_joined', 'last_login')
     ordering = ('email',)
+
+    def current_role_display(self, obj):
+        """Show the current year's role (or 'None')"""
+        membership = obj.current_membership
+        if membership and membership.role:
+            role_name = membership.role.name
+            if membership.role.is_president:
+                return format_html('<strong style="color: #0066cc;">{} (President)</strong>', role_name)
+            return role_name
+        return "—"
+    
+    current_role_display.short_description = "Current Role"
+
+    fieldsets = (
+        (None, {'fields': ('email', 'password')}),
+        ('Personal info', {'fields': ('name', 'photo', 'student_id', 'phone_number')}),
+        ('Status', {'fields': ('is_active', 'is_staff')}),
+        ('Important dates', {'fields': ('last_login', 'date_joined')}),
+    )
+
+
 
 @admin.register(Page)
 class PageAdmin(admin.ModelAdmin):
     list_display = ('name', 'description')
     search_fields = ('name',)
-    
-    
+
+
 @admin.register(Blog)
 class BlogAdmin(admin.ModelAdmin):
     list_display = (
@@ -29,7 +58,26 @@ class BlogAdmin(admin.ModelAdmin):
     )
     list_filter = ('approval_status', 'category', 'restricted', 'date')
     search_fields = ('title', 'excerpt', 'author')
-    list_editable = ('approval_status',)  # optional: quick edit in list view
-    date_hierarchy = 'date'    
-    
-# python manage.py createsuperuser --email superadmin@cseku.ac.bd --name "Super Admin"    # 
+    date_hierarchy = 'date'
+
+
+# Optionally register new models
+@admin.register(Role)
+class RoleAdmin(admin.ModelAdmin):
+    list_display = ('name', 'is_president', 'created_by', 'created_at')
+    list_filter = ('is_president',)
+    search_fields = ('name',)
+    filter_horizontal = ('permissions',)
+
+
+@admin.register(CommitteeMembership)
+class CommitteeMembershipAdmin(admin.ModelAdmin):
+    list_display = ('user', 'role', 'year', 'assigned_at')
+    list_filter = ('year', 'role__is_president')
+    search_fields = ('user__email', 'user__name', 'role__name')
+    date_hierarchy = 'assigned_at'
+
+
+@admin.register(SystemSetting)
+class SystemSettingAdmin(admin.ModelAdmin):
+    list_display = ('key', 'value')
