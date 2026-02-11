@@ -1,7 +1,7 @@
 # admins/admin.py
 from django.contrib import admin
 from django.utils.html import format_html
-from .models import CustomUser, Page, Blog, Role, CommitteeMembership, SystemSetting
+from .models import CustomUser, Page, Blog, Role, CommitteeMembership, SystemSetting,Alumni
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
@@ -77,6 +77,34 @@ class CommitteeMembershipAdmin(admin.ModelAdmin):
     search_fields = ('user__email', 'user__name', 'role__name')
     date_hierarchy = 'assigned_at'
 
+@admin.register(Alumni)
+class AlumniAdmin(admin.ModelAdmin):
+    list_display = (
+        'name',
+        'email',
+        'batch',
+        'session',
+        'passing_year',          # ← comment out
+        'current_role',
+        'company',
+        'location',
+        'approval_status',
+        'created_at',
+        'phone_number',          # ← comment out
+        'about',                 # ← comment out
+        'linkedin_url',          # ← comment out
+        'facebook_url',          # ← comment out
+        'approved_by',
+    )
+    list_filter = ('approval_status', 'batch', 'created_at')
+    search_fields = ('name', 'email', 'batch', 'current_role', 'company')
+    readonly_fields = ('created_at', 'updated_at', 'approved_by')
+    list_per_page = 20
+    ordering = ('-created_at',)
+
+    # Optional: add this to avoid future surprises
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('approved_by')
 
 @admin.register(SystemSetting)
 class SystemSettingAdmin(admin.ModelAdmin):

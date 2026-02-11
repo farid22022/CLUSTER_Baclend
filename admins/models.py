@@ -11,7 +11,7 @@ from simple_history.models import HistoricalRecords
 
 
 def get_current_year_default():
-    return timezone.now().year
+    return SystemSetting.get_current_year()
 
 class CustomUserManager(BaseUserManager):
     def create_user(self, email, name, password=None, **extra_fields):
@@ -87,8 +87,8 @@ class CommitteeMembership(models.Model):
         return f"{self.user} - {self.role} ({self.year})"
 
     class Meta:
-        unique_together = ['user', 'year']  # One role per user per year
-        indexes = [models.Index(fields=['year', 'user'])]
+        ordering = ['-year', 'user__name']  # Added for better querying
+        unique_together = ['user', 'year']  # Unchanged
 
 
 class CustomUser(AbstractBaseUser, PermissionsMixin):
@@ -286,22 +286,35 @@ class Event(models.Model):
         return self.title
 
 class Alumni(models.Model):
+    APPROVAL_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+
     name = models.CharField(max_length=255)
-    batch = models.CharField(max_length=50)
-    session = models.CharField(max_length=50, blank=True)
-    role = models.CharField(max_length=100, blank=True)
-    company = models.CharField(max_length=100, blank=True)
+    email = models.EmailField(unique=True)
+    phone_number = models.CharField(max_length=20, blank=True, null=True)
+    batch = models.CharField(max_length=100)              # e.g. CSE-17
+    session = models.CharField(max_length=100, blank=True)
+    passing_year = models.PositiveIntegerField(null=True, blank=True)
+    current_role = models.CharField(max_length=100, blank=True)  # ← renamed from 'role'
+    company = models.CharField(max_length=200, blank=True)
     location = models.CharField(max_length=100, blank=True)
     image_url = models.CharField(max_length=500, blank=True)
-    email = models.EmailField(blank=True)
-    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
+    linkedin_url = models.URLField(blank=True, null=True)
+    facebook_url = models.URLField(blank=True, null=True)
+    about = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    year = models.PositiveIntegerField(default=get_current_year_default)
-    history = HistoricalRecords()
+    approval_status = models.CharField(max_length=10, choices=APPROVAL_CHOICES, default='pending')
+    approved_by = models.ForeignKey('CustomUser', null=True, blank=True, on_delete=models.SET_NULL, related_name='approved_alumni')
 
     def __str__(self):
-        return self.name
+        return f"{self.name} ({self.batch})"
+
+    class Meta:
+        ordering = ['-created_at']
 
 class TeamMember(models.Model):
     designation = models.CharField(max_length=100)
@@ -320,6 +333,9 @@ class TeamMember(models.Model):
 
     def __str__(self):
         return self.name
+    
+    class Meta:
+        ordering = ['-year', 'name']
 
 class SuccessStory(models.Model):
     name = models.CharField(max_length=255)

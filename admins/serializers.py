@@ -38,19 +38,58 @@ class RoleSerializer(serializers.ModelSerializer):
         return data
 
 
+# class CommitteeMembershipSerializer(serializers.ModelSerializer):
+#     role = RoleSerializer(read_only=True)
+    
+#     user_name = serializers.CharField(source='user.name', read_only=True)
+#     user_photo = serializers.ImageField(source='user.photo', read_only=True, allow_null=True)
+#     user_student_id = serializers.CharField(source='user.student_id', read_only=True, allow_null=True)
+#     user_email = serializers.EmailField(source='user.email', read_only=True)
+
+#     class Meta:
+#         model = CommitteeMembership
+#         fields = [
+#             'id', 'user', 'user_name', 'user_photo', 'user_student_id', 'user_email',
+#             'role', 'year', 'assigned_at'
+#         ]
 class CommitteeMembershipSerializer(serializers.ModelSerializer):
     role = RoleSerializer(read_only=True)
+    
+    # This is the write-only field for creating/updating
     role_id = serializers.PrimaryKeyRelatedField(
         queryset=Role.objects.all(),
+        source='role',          # maps to the actual model field 'role'
         write_only=True,
-        source='role'
+        required=True,
+        error_messages={'required': 'Role is required.'}
     )
+
+    # Extra read-only fields for nice display
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    user_photo = serializers.ImageField(source='user.photo', read_only=True, allow_null=True)
+    user_student_id = serializers.CharField(source='user.student_id', read_only=True, allow_null=True)
     user_email = serializers.EmailField(source='user.email', read_only=True)
 
     class Meta:
         model = CommitteeMembership
-        fields = ['id', 'user', 'role', 'role_id', 'year', 'assigned_at', 'user_email']
+        fields = [
+            'id',
+            'user',
+            'user_name',
+            'user_photo',
+            'user_student_id',
+            'user_email',
+            'role',         # read-only nested role
+            'role_id',      # ← MUST be here! (write-only)
+            'year',
+            'assigned_at',
+        ]
         read_only_fields = ['assigned_at']
+
+    def validate_role_id(self, value):
+        if not value:
+            raise serializers.ValidationError("Role is required.")
+        return value
 
 
 class CustomUserSerializer(serializers.ModelSerializer):
@@ -150,7 +189,7 @@ class AlumniSerializer(serializers.ModelSerializer):
     class Meta:
         model = Alumni
         fields = '__all__'
-        read_only_fields = ['created_by', 'created_at', 'updated_at', 'year']
+        read_only_fields = ['created_at', 'updated_at', 'approval_status', 'approved_by']  # Approval read-only for create
 
 
 class TeamMemberSerializer(serializers.ModelSerializer):

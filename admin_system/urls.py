@@ -101,7 +101,7 @@ from admins.views import (
     RoleViewSet, CommitteeMembershipViewSet,
     # Custom views
     RegistrationView, VerifyOTPView, LogoutView, ImportTeamMembersView,
-    HandoverView,
+    HandoverView,CurrentYearView
 )
 
 
@@ -161,6 +161,9 @@ urlpatterns = [
     path('api/auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/auth/logout/', LogoutView.as_view(), name='logout'),
+    
+    # urls.py
+    path('api/system-settings/current-year/', CurrentYearView.as_view(), name='current-year'),
 ]
 
 # Serve media files in development

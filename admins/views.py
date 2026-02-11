@@ -49,6 +49,16 @@ from .permissions import (
 def get_current_year():
     return SystemSetting.get_current_year()
 
+# views.py
+class CurrentYearView(APIView):
+    """
+    Returns the current committee/academic year.
+    """
+    permission_classes = [AllowAny]  # or [IsAuthenticated] if you prefer
+
+    def get(self, request):
+        current_year = SystemSetting.get_current_year()
+        return Response({"current_year": current_year})
 
 # ────────────────────────────────────────────────
 # Authentication Views
@@ -196,24 +206,47 @@ class CommitteeMembershipViewSet(viewsets.ModelViewSet):
 class HandoverView(APIView):
     permission_classes = [IsCurrentPresident]
 
-    @transaction.atomic
     def post(self, request):
-        current_year = get_current_year()
-        next_year = current_year + 1
+        new_year = request.data.get('new_year')
+        new_president_id = request.data.get('new_president_id')
+        archive_old = request.data.get('archive_old', False)  # New: optional archiving
 
-        if not CommitteeMembership.objects.filter(
-            year=next_year,
-            role__is_president=True
-        ).exists():
-            return Response(
-                {"error": "No President assigned for next year."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not new_year or not new_president_id:
+            return Response({"error": "new_year and new_president_id required"}, status=400)
 
-        SystemSetting.set_current_year(next_year)
-        return Response({
-            "message": f"Handover completed. Current year is now {next_year}."
-        })
+        try:
+            with transaction.atomic():
+                if archive_old:
+                    prev_year = SystemSetting.get_current_year()
+                    old_memberships = CommitteeMembership.objects.filter(year=prev_year)
+                    for m in old_memberships:
+                        Alumni.objects.create(
+                            name=m.user.name,
+                            batch=f"{prev_year} Committee",  # Example archiving
+                            role=m.role.name,
+                            email=m.user.email,
+                            year=prev_year,
+                            created_by=request.user,
+                        )
+                    old_memberships.delete()  
+
+                SystemSetting.set_current_year(new_year)
+
+                new_president = CustomUser.objects.get(id=new_president_id)
+                president_role = Role.objects.filter(is_president=True).first()
+                if not president_role:
+                    return Response({"error": "No president role defined"}, status=400)
+
+                CommitteeMembership.objects.create(
+                    user=new_president,
+                    role=president_role,
+                    year=new_year
+                )
+
+                return Response({"message": f"Handover to {new_year} complete. New president: {new_president.email}"})
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=400)
 
 
 # ────────────────────────────────────────────────
@@ -471,14 +504,34 @@ class PostViewSet(viewsets.ModelViewSet):
 class AlumniViewSet(viewsets.ModelViewSet):
     queryset = Alumni.objects.all()
     serializer_class = AlumniSerializer
-    permission_classes = [IsPresidentOrAdmin, CanModifyCurrentYearContent]
+    permission_classes = [IsAuthenticated, HasPagePermission, CanModifyCurrentYearContent]
+    page_name = 'alumni'
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'create']:
+            return [AllowAny()]  # Public can see approved & submit new
+        return super().get_permissions()
 
     def get_queryset(self):
-        year = self.request.query_params.get('year')
-        qs = self.queryset
-        if year:
-            qs = qs.filter(year=year)
-        return qs
+        qs = super().get_queryset()
+        if not self.request.user.is_authenticated:
+            qs = qs.filter(approval_status='approved')
+        return qs.order_by('-created_at')
+
+    @action(detail=True, methods=['post'], permission_classes=[IsCurrentPresident])
+    def approve(self, request, pk=None):
+        obj = self.get_object()
+        obj.approval_status = 'approved'
+        obj.approved_by = request.user
+        obj.save()
+        return Response({'status': 'approved'})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsCurrentPresident])
+    def reject(self, request, pk=None):
+        obj = self.get_object()
+        obj.approval_status = 'rejected'
+        obj.save()
+        return Response({'status': 'rejected'})
 
 
 class TeamMemberViewSet(viewsets.ModelViewSet):
@@ -498,11 +551,106 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
 # Yearly Committee CSV Import
 # ────────────────────────────────────────────────
 
+# class ImportTeamMembersView(APIView):
+#     """
+#     President-only endpoint.
+#     Imports committee from CSV → creates/updates users, roles, memberships, TeamMember entries.
+#     Optionally archives previous year's committee to Alumni.
+#     """
+#     permission_classes = [IsCurrentPresident]
+
+#     def post(self, request):
+#         archive_old = request.data.get("archive_old", False)
+#         file = request.FILES.get("file")
+#         target_year = int(request.data.get('year', get_current_year()))
+
+#         if not file:
+#             return Response({"error": "CSV file is required"}, status=400)
+
+#         try:
+#             if archive_old:
+#                 prev_year = target_year - 1
+#                 old_memberships = CommitteeMembership.objects.filter(year=prev_year)
+#                 for m in old_memberships:
+#                     Alumni.objects.create(
+#                         name=m.user.name,
+#                         role=m.role.name,
+#                         email=m.user.email,
+#                         # image_url=... (you may want to copy from TeamMember if exists)
+#                         year=prev_year,
+#                         created_by=request.user,
+#                     )
+#                 old_memberships.delete()
+
+#             content = file.read().decode("utf-8-sig")
+#             reader = csv.DictReader(StringIO(content))
+
+#             count = 0
+
+#             for row in reader:
+#                 role_name = row.get("Designation", "").strip()
+#                 name = row.get("Name", "").strip()
+#                 email = row.get("Email", "").strip()
+
+#                 if not role_name or not email or not name:
+#                     continue
+
+#                 user, _ = CustomUser.objects.update_or_create(
+#                     email=email,
+#                     defaults={
+#                         "name": name,
+#                         "password": make_password(f"committee{target_year}!"),
+#                         "is_active": True,
+#                         "is_staff": True,
+#                         "student_id": row.get("Student ID", ""),
+#                         "photo": row.get("Image URL", ""),
+#                     }
+#                 )
+
+#                 role, _ = Role.objects.get_or_create(
+#                     name=role_name,
+#                     defaults={"created_by": request.user}
+#                 )
+
+#                 CommitteeMembership.objects.update_or_create(
+#                     user=user,
+#                     year=target_year,
+#                     defaults={"role": role}
+#                 )
+
+#                 TeamMember.objects.update_or_create(
+#                     email=email,
+#                     defaults={
+#                         "designation": role_name,
+#                         "name": name,
+#                         "student_id": row.get("Student ID", ""),
+#                         "image_url": row.get("Image URL", ""),
+#                         "facebook_url": row.get("Facebook URL", ""),
+#                         "linkedin_url": row.get("LinkedIn URL", ""),
+#                         "quote": row.get("Quote", ""),
+#                         "created_by": request.user,
+#                         "year": target_year,
+#                     }
+#                 )
+
+#                 count += 1
+
+#             msg = f"Processed {count} committee members for year {target_year}."
+#             if archive_old:
+#                 msg += f" Previous year ({target_year-1}) archived."
+
+#             return Response({"message": msg}, status=200)
+
+#         except Exception as e:
+#             return Response({"error": f"Import failed: {str(e)}"}, status=400)
+
+# ... (rest of the file unchanged)
+
 class ImportTeamMembersView(APIView):
     """
     President-only endpoint.
     Imports committee from CSV → creates/updates users, roles, memberships, TeamMember entries.
-    Optionally archives previous year's committee to Alumni.
+    Optionally archives previous year's committee (memberships preserved - no Alumni creation).
     """
     permission_classes = [IsCurrentPresident]
 
@@ -517,17 +665,8 @@ class ImportTeamMembersView(APIView):
         try:
             if archive_old:
                 prev_year = target_year - 1
-                old_memberships = CommitteeMembership.objects.filter(year=prev_year)
-                for m in old_memberships:
-                    Alumni.objects.create(
-                        name=m.user.name,
-                        role=m.role.name,
-                        email=m.user.email,
-                        # image_url=... (you may want to copy from TeamMember if exists)
-                        year=prev_year,
-                        created_by=request.user,
-                    )
-                old_memberships.delete()
+                # Old memberships remain for history (no deletion, no Alumni creation)
+                pass
 
             content = file.read().decode("utf-8-sig")
             reader = csv.DictReader(StringIO(content))
@@ -584,9 +723,11 @@ class ImportTeamMembersView(APIView):
 
             msg = f"Processed {count} committee members for year {target_year}."
             if archive_old:
-                msg += f" Previous year ({target_year-1}) archived."
+                msg += f" Previous year ({target_year-1}) archived (memberships preserved)."
 
             return Response({"message": msg}, status=200)
 
         except Exception as e:
             return Response({"error": f"Import failed: {str(e)}"}, status=400)
+
+# ... (HandoverView unchanged - it should just update current_year and new president)
